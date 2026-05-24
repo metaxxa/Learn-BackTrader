@@ -44,6 +44,8 @@ class Config:
 
     # Сетка
     grid_levels: int = 7
+    grid_mode: str = "arithmetic"  # "arithmetic" or "geometric"
+    martingale_multiplier: float = 1.0  # > 1.0 increases size for further levels
     vol_method: str = "garch"  # "atr", "bollinger", "garch", "hybrid"
     vol_lookback: int = 300
     k_multiplier: float = 1.5
@@ -163,6 +165,8 @@ class RiskManager:
 class GridLevel:
     price: float
     side: str
+    level_idx: int = 1  # Distance from center
+    amount: Optional[float] = None
     order_id: Optional[str] = None
     filled: bool = False
     timestamp: Optional[datetime] = None
@@ -282,15 +286,30 @@ class AdvancedDynamicGridBot:
     def calculate_grid(self, center: float, step: float) -> List[GridLevel]:
         """Построение сетки вокруг центра."""
         levels = []
-        for i in range(1, self.config.grid_levels + 1):
-            levels.append(GridLevel(
-                price=self.format_price(center - i * step),
-                side="buy", timestamp=datetime.now()
-            ))
-            levels.append(GridLevel(
-                price=self.format_price(center + i * step),
-                side="sell", timestamp=datetime.now()
-            ))
+
+        if self.config.grid_mode == "geometric":
+            # step is treated as absolute volatility, convert to ratio
+            ratio = 1 + (step / center)
+            for i in range(1, self.config.grid_levels + 1):
+                levels.append(GridLevel(
+                    price=self.format_price(center / (ratio ** i)),
+                    side="buy", level_idx=i, timestamp=datetime.now()
+                ))
+                levels.append(GridLevel(
+                    price=self.format_price(center * (ratio ** i)),
+                    side="sell", level_idx=i, timestamp=datetime.now()
+                ))
+        else:
+            # Arithmetic grid
+            for i in range(1, self.config.grid_levels + 1):
+                levels.append(GridLevel(
+                    price=self.format_price(center - i * step),
+                    side="buy", level_idx=i, timestamp=datetime.now()
+                ))
+                levels.append(GridLevel(
+                    price=self.format_price(center + i * step),
+                    side="sell", level_idx=i, timestamp=datetime.now()
+                ))
         return sorted(levels, key=lambda l: l.price)
 
     def log_trade(self, side: str, price: float, amount: float, pnl: float = 0):
@@ -303,12 +322,22 @@ class AdvancedDynamicGridBot:
         except Exception as e:
             logging.error(f"DB error: {e}")
 
-    async def place_order(self, level: GridLevel) -> Optional[str]:
-        amount = self.format_amount((self.config.initial_capital * self.config.order_size_pct) / level.price)
+    async def place_order(self, level: GridLevel, bypass_risk: bool = False, amount: Optional[float] = None) -> Optional[str]:
+        if amount is None:
+            # Base size
+            base_size = self.config.initial_capital * self.config.order_size_pct
+            # Martingale scaling
+            scaled_size = base_size * (self.config.martingale_multiplier ** (level.level_idx - 1))
+            amount = self.format_amount(scaled_size / level.price)
+        else:
+            amount = self.format_amount(amount)
 
-        current_pos_value = self.position * level.price # Approximate
-        if not self.risk.can_open_position(amount * level.price, current_pos_value):
-            return None
+        if not bypass_risk:
+            current_pos_value = self.position * level.price # Approximate
+            if not self.risk.can_open_position(amount * level.price, current_pos_value):
+                return None
+
+        level.amount = amount
 
         if self.config.dry_run:
             logging.info(f"[DRY] {level.side.upper()} {amount:.6f} @ {level.price}")
@@ -412,7 +441,7 @@ class AdvancedDynamicGridBot:
 
             if filled:
                 lvl.filled = True
-                amount = self.format_amount((self.config.initial_capital * self.config.order_size_pct) / fill_price)
+                amount = lvl.amount if lvl.amount is not None else 0
 
                 fee = amount * fill_price * self.config.commission if self.config.backtest or self.config.dry_run else 0
 
@@ -438,8 +467,13 @@ class AdvancedDynamicGridBot:
         self.trailing_high = max(self.trailing_high, current_price)
         self.trailing_low = min(self.trailing_low, current_price)
 
-        upper_boundary = self.center_price + self.config.grid_levels * step
-        lower_boundary = self.center_price - self.config.grid_levels * step
+        if self.config.grid_mode == "geometric":
+            ratio = 1 + (step / self.center_price)
+            upper_boundary = self.center_price * (ratio ** self.config.grid_levels)
+            lower_boundary = self.center_price / (ratio ** self.config.grid_levels)
+        else:
+            upper_boundary = self.center_price + self.config.grid_levels * step
+            lower_boundary = self.center_price - self.config.grid_levels * step
 
         activation_move = self.center_price * self.config.trailing_activation
 
@@ -492,7 +526,7 @@ class AdvancedDynamicGridBot:
                     await self.cancel_all()
                     if abs(self.position) > 0:
                         side = "sell" if self.position > 0 else "buy"
-                        await self.place_order(GridLevel(price=price, side=side))
+                        await self.place_order(GridLevel(price=price, side=side), bypass_risk=True, amount=abs(self.position))
                     break
 
                 # Трейлинг
@@ -538,6 +572,8 @@ if __name__ == "__main__":
             initial_capital=100000,
             vol_method="garch",
             grid_levels=5,
+            grid_mode="geometric",
+            martingale_multiplier=1.2,
             k_multiplier=2.0,
             backtest=True,
             csv_path="GAZP_D1.csv",
