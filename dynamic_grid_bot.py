@@ -12,7 +12,7 @@ Advanced Dynamic Grid Bot v2.0
 pip install ccxt pandas pandas_ta arch numpy sqlite3 python-telegram-bot httpx
 """
 
-import ccxt
+import ccxt.async_support as ccxt
 import pandas as pd
 import pandas_ta as ta
 import numpy as np
@@ -45,7 +45,7 @@ class Config:
     # Сетка
     grid_levels: int = 7
     vol_method: str = "garch"  # "atr", "bollinger", "garch", "hybrid"
-    vol_lookback: int = 100
+    vol_lookback: int = 300
     k_multiplier: float = 1.5
 
     # Риск-менеджмент
@@ -61,6 +61,7 @@ class Config:
     dry_run: bool = True
     backtest: bool = False
     csv_path: str = ""
+    commission: float = 0.001  # 0.1% по умолчанию
     telegram_token: str = ""
     telegram_chat_id: str = ""
 
@@ -99,10 +100,11 @@ class VolatilityModel:
         """GARCH(1,1) прогноз на 1 период вперёд."""
         try:
             returns = df["close"].pct_change().dropna() * 100
-            if len(returns) < 50:
+            if len(returns) < 100:
                 return self._atr(df)  # Fallback
 
-            model = arch_model(returns, p=1, q=1, dist='studentst', rescale=False)
+            # Use rescale=True for better convergence
+            model = arch_model(returns, p=1, q=1, dist='studentst', rescale=True)
             res = model.fit(disp='off', show_warning=False)
             forecast = res.forecast(horizon=1)
             var_forecast = forecast.variance.iloc[-1].values[0]
@@ -139,14 +141,15 @@ class RiskManager:
             return 0
         return (self.peak_equity - self.current_equity) / self.peak_equity
 
-    def can_open_position(self, position_value: float) -> bool:
+    def can_open_position(self, order_value: float, current_pos_value: float) -> bool:
         """Проверка лимитов перед открытием."""
         if self.drawdown > self.config.max_drawdown_pct:
             logging.error(f"🛑 Max DD breached: {self.drawdown:.2%}")
             return False
 
-        if position_value / self.current_equity > self.config.max_position_pct:
-            logging.warning("🛑 Position limit reached")
+        total_val = abs(current_pos_value) + order_value
+        if total_val / self.current_equity > self.config.max_position_pct:
+            logging.warning(f"🛑 Position limit reached: {total_val/self.current_equity:.2%}")
             return False
 
         return True
@@ -252,7 +255,8 @@ class AdvancedDynamicGridBot:
         if not self.config.dry_run:
             params["apiKey"] = self.config.api_key
             params["secret"] = self.config.api_secret
-        return getattr(ccxt, self.config.exchange)(params)
+        exchange_class = getattr(ccxt, self.config.exchange)
+        return exchange_class(params)
 
     def _init_db(self):
         conn = sqlite3.connect("grid_bot.db")
@@ -266,8 +270,8 @@ class AdvancedDynamicGridBot:
         conn.commit()
         return conn
 
-    def fetch_data(self) -> pd.DataFrame:
-        raw = self.exchange.fetch_ohlcv(
+    async def fetch_data(self) -> pd.DataFrame:
+        raw = await self.exchange.fetch_ohlcv(
             self.config.symbol, self.config.timeframe,
             limit=self.config.vol_lookback
         )
@@ -280,11 +284,11 @@ class AdvancedDynamicGridBot:
         levels = []
         for i in range(1, self.config.grid_levels + 1):
             levels.append(GridLevel(
-                price=round(center - i * step, 2),
+                price=self.format_price(center - i * step),
                 side="buy", timestamp=datetime.now()
             ))
             levels.append(GridLevel(
-                price=round(center + i * step, 2),
+                price=self.format_price(center + i * step),
                 side="sell", timestamp=datetime.now()
             ))
         return sorted(levels, key=lambda l: l.price)
@@ -299,10 +303,11 @@ class AdvancedDynamicGridBot:
         except Exception as e:
             logging.error(f"DB error: {e}")
 
-    def place_order(self, level: GridLevel) -> Optional[str]:
-        amount = (self.config.initial_capital * self.config.order_size_pct) / level.price
+    async def place_order(self, level: GridLevel) -> Optional[str]:
+        amount = self.format_amount((self.config.initial_capital * self.config.order_size_pct) / level.price)
 
-        if not self.risk.can_open_position(amount * level.price):
+        current_pos_value = self.position * level.price # Approximate
+        if not self.risk.can_open_position(amount * level.price, current_pos_value):
             return None
 
         if self.config.dry_run:
@@ -310,7 +315,7 @@ class AdvancedDynamicGridBot:
             return f"sim_{int(time.time()*1000)}"
 
         try:
-            order = self.exchange.create_limit_order(
+            order = await self.exchange.create_limit_order(
                 self.config.symbol, level.side, amount, level.price
             )
             return order["id"]
@@ -318,18 +323,33 @@ class AdvancedDynamicGridBot:
             logging.error(f"Order error: {e}")
             return None
 
-    def cancel_all(self):
+    async def cancel_all(self):
         if self.config.dry_run:
             return
         try:
-            for o in self.exchange.fetch_open_orders(self.config.symbol):
-                self.exchange.cancel_order(o["id"], self.config.symbol)
+            orders = await self.exchange.fetch_open_orders(self.config.symbol)
+            for o in orders:
+                await self.exchange.cancel_order(o["id"], self.config.symbol)
         except Exception as e:
             logging.error(f"Cancel error: {e}")
 
+    async def load_markets(self):
+        if not self.config.dry_run and not self.config.backtest:
+            await self.exchange.load_markets()
+
+    def format_price(self, price: float) -> float:
+        if self.config.dry_run or self.config.backtest:
+            return round(price, 2)
+        return float(self.exchange.price_to_precision(self.config.symbol, price))
+
+    def format_amount(self, amount: float) -> float:
+        if self.config.dry_run or self.config.backtest:
+            return round(amount, 6)
+        return float(self.exchange.amount_to_precision(self.config.symbol, amount))
+
     async def deploy_grid(self):
         for lvl in self.grid_levels:
-            lvl.order_id = self.place_order(lvl)
+            lvl.order_id = await self.place_order(lvl)
             if not self.config.backtest:
                 await asyncio.sleep(0.2)
 
@@ -352,6 +372,15 @@ class AdvancedDynamicGridBot:
             logging.error(f"Telegram error: {e}")
 
     async def check_fills(self, current_price: float, high: Optional[float] = None, low: Optional[float] = None):
+        if not self.config.dry_run and not self.config.backtest:
+            # For live trading, fetch all open orders once to reduce API calls
+            try:
+                open_orders = await self.exchange.fetch_open_orders(self.config.symbol)
+                open_ids = [o['id'] for o in open_orders]
+            except Exception as e:
+                logging.error(f"Error fetching open orders: {e}")
+                return
+
         for lvl in self.grid_levels:
             if lvl.filled or not lvl.order_id:
                 continue
@@ -359,7 +388,7 @@ class AdvancedDynamicGridBot:
             filled = False
             fill_price = lvl.price
 
-            if self.config.dry_run:
+            if self.config.dry_run or self.config.backtest:
                 # In backtest we can use high/low for better accuracy
                 if self.config.backtest and high is not None and low is not None:
                     if lvl.side == "buy" and low <= lvl.price:
@@ -371,23 +400,27 @@ class AdvancedDynamicGridBot:
                        (lvl.side == "sell" and current_price >= lvl.price):
                         filled = True
             else:
-                try:
-                    order = self.exchange.fetch_order(lvl.order_id, self.config.symbol)
-                    if order['status'] == 'closed':
-                        filled = True
-                        fill_price = order['average'] or order['price']
-                except Exception as e:
-                    logging.error(f"Error fetching order {lvl.order_id}: {e}")
+                if lvl.order_id not in open_ids:
+                    # Order is no longer open, check if it was closed (filled)
+                    try:
+                        order = await self.exchange.fetch_order(lvl.order_id, self.config.symbol)
+                        if order['status'] == 'closed':
+                            filled = True
+                            fill_price = order['average'] or order['price']
+                    except Exception as e:
+                        logging.error(f"Error fetching order {lvl.order_id}: {e}")
 
             if filled:
                 lvl.filled = True
-                amount = (self.config.initial_capital * self.config.order_size_pct) / fill_price
+                amount = self.format_amount((self.config.initial_capital * self.config.order_size_pct) / fill_price)
+
+                fee = amount * fill_price * self.config.commission if self.config.backtest or self.config.dry_run else 0
 
                 if lvl.side == "buy":
-                    self.balance -= amount * fill_price
+                    self.balance -= (amount * fill_price + fee)
                     self.position += amount
                 else:
-                    self.balance += amount * fill_price
+                    self.balance += (amount * fill_price - fee)
                     self.position -= amount
 
                 # Update Risk Manager
@@ -436,11 +469,12 @@ class AdvancedDynamicGridBot:
         logging.info(f"🚀 Bot started | {self.config.symbol} | {self.config.vol_method}")
         logging.info(f"   Capital: ${self.config.initial_capital} | Levels: {self.config.grid_levels}")
 
+        await self.load_markets()
         self.risk.update_equity(self.config.initial_capital)
 
         while True:
             try:
-                df = self.fetch_data()
+                df = await self.fetch_data()
                 price = float(df["close"].iloc[-1])
                 vol = self.vol_model.calculate(df)
                 step = vol * self.config.k_multiplier
@@ -454,13 +488,16 @@ class AdvancedDynamicGridBot:
 
                 # Проверка риск-менеджера
                 if self.risk.should_stop():
-                    await self.notify("🛑 STOP: Max drawdown reached")
-                    self.cancel_all()
+                    await self.notify("🛑 STOP: Max drawdown reached. Closing positions...")
+                    await self.cancel_all()
+                    if abs(self.position) > 0:
+                        side = "sell" if self.position > 0 else "buy"
+                        await self.place_order(GridLevel(price=price, side=side))
                     break
 
                 # Трейлинг
                 if self.check_trailing(price, step):
-                    self.cancel_all()
+                    await self.cancel_all()
                     self.grid_levels = self.calculate_grid(self.center_price, step)
                     await self.deploy_grid()
                     await self.notify(f"🔄 Grid trailed to {self.center_price:.2f}")
@@ -471,7 +508,7 @@ class AdvancedDynamicGridBot:
                     logging.info(f"🔄 Vol changed: {self.last_vol} → {vol:.2f}")
                     if self.center_price == 0:
                         self.center_price = price
-                    self.cancel_all()
+                    await self.cancel_all()
                     self.grid_levels = self.calculate_grid(self.center_price, step)
                     await self.deploy_grid()
                     self.last_vol = vol
@@ -481,7 +518,8 @@ class AdvancedDynamicGridBot:
 
             except KeyboardInterrupt:
                 logging.info("⛔ Manual stop")
-                self.cancel_all()
+                await self.cancel_all()
+                await self.exchange.close()
                 break
             except Exception as e:
                 logging.error(f"Loop error: {e}")
